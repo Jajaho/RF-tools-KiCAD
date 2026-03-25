@@ -178,7 +178,10 @@ def set_keepouts(pcb, tracks, clearance):
             pts = poly_points(track_start, track_end, track_midpoint, track_width, clearance)
             keepout.AddPolygon(pts)
             keepout.SetIsKeepout(True)
-            keepout.SetDoNotAllowCopperPour(True)
+            if hasattr(keepout, 'SetDoNotAllowCopperPour'):
+                keepout.SetDoNotAllowCopperPour(True)
+            else:
+                keepout.SetDoNotAllowZoneFills(True)
             keepout.SetDoNotAllowVias(False)
             keepout.SetDoNotAllowTracks(False)
             keepout.SetLayerSet(layer)
@@ -188,7 +191,10 @@ def set_keepouts(pcb, tracks, clearance):
             keepout.AddPolygon(pts)
             #keepout.SetIsKeepout(True)
             keepout.SetIsRuleArea(True)  # was SetIsKeepout
-            keepout.SetDoNotAllowCopperPour(True)
+            if hasattr(keepout, 'SetDoNotAllowCopperPour'):
+                keepout.SetDoNotAllowCopperPour(True)
+            else:
+                keepout.SetDoNotAllowZoneFills(True)
             keepout.SetDoNotAllowVias(False)
             keepout.SetDoNotAllowTracks(False)
             keepout.SetLayerSet(layer)
