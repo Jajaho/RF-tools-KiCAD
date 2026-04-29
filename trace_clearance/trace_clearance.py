@@ -32,6 +32,12 @@ from . import TraceClearanceDlg
 import math
 import configparser
 
+# When True, all per-segment keepout polygons that share the same layer set
+# are merged into a single ZONE outline using a SHAPE_POLY_SET boolean union.
+# When False, the plugin emits one zone per segment (the original behaviour).
+MERGE_ZONES = True
+
+
 class TraceClearance_Dlg(TraceClearanceDlg.TraceClearanceDlg):
     """
     """
@@ -65,7 +71,7 @@ class TraceClearance(pcbnew.ActionPlugin):
     def defaults(self):
         """
         """
-        self.name = "Trace Clearance Generator\n version 1.8"
+        self.name = "Trace Clearance Generator\n version 1.9"
         self.category = "Modify PCB"
         self.description = (
             "Generate a copper pour keepout for a selected trace."
@@ -74,7 +80,7 @@ class TraceClearance(pcbnew.ActionPlugin):
         self.icon_file_name = os.path.join(
             os.path.dirname(__file__), "./trace_clearance.png"
         )
-        
+
     def Run(self):
         """
         """
@@ -144,7 +150,7 @@ def selected_tracks(pcb):
     redundant functionality?
     """
     tracks = []
-    
+
     if  hasattr(pcbnew,'TRACK'):
         track_item = pcbnew.TRACK
     else:
@@ -153,51 +159,200 @@ def selected_tracks(pcb):
     for item in pcb.GetTracks():
         if (type(item) is track_item or type(item) is trk_arc) and item.IsSelected():
             tracks.append(item)
-            
+
     return tracks
 
 
-def set_keepouts(pcb, tracks, clearance):
+# ---------------------------------------------------------------------------
+# Helpers shared between the original per-segment path and the new merged path
+# ---------------------------------------------------------------------------
+
+def _new_keepout(pcb):
+    """Create a fresh ZONE/ZONE_CONTAINER configured as a copper-pour keepout.
+
+    Encapsulates the kv5/kv6 vs kv7+ split that used to live duplicated in
+    set_keepouts.
     """
+    if hasattr(pcbnew, 'ZONE_CONTAINER'):
+        keepout = pcbnew.ZONE_CONTAINER(pcb)
+        keepout.SetIsKeepout(True)
+    else:
+        keepout = pcbnew.ZONE(pcb)
+        keepout.SetIsRuleArea(True)  # was SetIsKeepout
+    if hasattr(keepout, 'SetDoNotAllowCopperPour'):
+        keepout.SetDoNotAllowCopperPour(True)
+    else:
+        keepout.SetDoNotAllowZoneFills(True)
+    keepout.SetDoNotAllowVias(False)
+    keepout.SetDoNotAllowTracks(False)
+    return keepout
+
+
+def _layer_set_key(layer_set):
+    """Return a hashable key for a pcbnew LSET.
+
+    LSET isn't directly hashable across all pcbnew versions, so we project
+    it down to the bytestring formatting it produces.  Two tracks share a
+    key iff they share the exact same set of enabled layers.
     """
+    if hasattr(layer_set, 'FmtBin'):
+        return layer_set.FmtBin()
+    if hasattr(layer_set, 'FmtHex'):
+        return layer_set.FmtHex()
+    enabled = []
+    seq = layer_set.Seq() if hasattr(layer_set, 'Seq') else []
+    for lay in seq:
+        enabled.append(int(lay))
+    return tuple(sorted(enabled))
+
+
+def _polyset_simplify(poly_set):
+    """Run SHAPE_POLY_SET.Simplify with the right argument for this kicad."""
+    if hasattr(pcbnew.SHAPE_POLY_SET, 'PM_FAST'):
+        try:
+            poly_set.Simplify(pcbnew.SHAPE_POLY_SET.PM_FAST)
+            return
+        except (TypeError, NotImplementedError):
+            pass
+    poly_set.Simplify()
+
+
+def _polyset_from_pts(pts):
+    """Build a single-outline SHAPE_POLY_SET from a sequence of pcbnew points.
+
+    `pts` may be a Python list or one of the pcbnew vector wrappers returned
+    by poly_points(); both are iterable and expose .x / .y on each element.
+    """
+    poly = pcbnew.SHAPE_POLY_SET()
+    poly.NewOutline()
+    idx = poly.OutlineCount() - 1
+    for p in pts:
+        poly.Append(int(p.x), int(p.y), idx)
+    return poly
+
+
+def _outline_to_pt_vector(poly_set, outline_idx):
+    """Convert a single outline of `poly_set` into a pcbnew point vector
+    suitable for ZONE.AddPolygon().
+
+    Mirrors what poly_points() returns at the end of its straight-track
+    branch, so the merged-path output is interchangeable with the
+    per-segment path output as far as AddPolygon is concerned.
+    """
+    outline = poly_set.Outline(outline_idx)
+    n = outline.PointCount()
+    use_wxpoint = hasattr(pcbnew, 'EDA_RECT')  # kv5/kv6
+    pts = []
+    for i in range(n):
+        pt = outline.CPoint(i)
+        if use_wxpoint:
+            pts.append(pcbnew.wxPoint(int(pt.x), int(pt.y)))
+        else:
+            pts.append(pcbnew.VECTOR2I(int(pt.x), int(pt.y)))
+    if use_wxpoint:
+        return pcbnew.wxPoint_Vector(pts)
+    return pcbnew.VECTOR_VECTOR2I(pts)
+
+
+# ---------------------------------------------------------------------------
+# set_keepouts: original entry point, now optionally unioning across segments
+# ---------------------------------------------------------------------------
+
+def set_keepouts(pcb, tracks, clearance, merge=None):
+    """Generate copper-pour rule areas around each selected track.
+
+    Parameters
+    ----------
+    pcb, tracks, clearance:
+        Same meaning as before.
+    merge:
+        If True, all polygons sharing a layer set are unioned into a single
+        ZONE outline via SHAPE_POLY_SET boolean ops + Simplify before being
+        added to the board.  If False, behave like the original plugin
+        (one ZONE per segment).  If None, fall back to the module-level
+        MERGE_ZONES setting.
+    """
+    if merge is None:
+        merge = MERGE_ZONES
+
+    # First pass: build per-segment polygons exactly as before, but
+    # accumulate them by layer set instead of creating a zone immediately.
+    # Each bucket is keyed on the hashable layer-set fingerprint and
+    # carries one representative LSET to hand back to ZONE.SetLayerSet.
+    by_layer = {}
+
     for track in tracks:
         track_start = track.GetStart()
         track_end = track.GetEnd()
         if track_start.x == track_end.x and track_start.y == track_end.y:
-            continue # skip if the track starts and stops at the same point
+            continue  # skip if the track starts and stops at the same point
         track_width = track.GetWidth()
         layer = track.GetLayerSet()
         track_midpoint = track.GetMid() if type(track) is pcbnew.PCB_ARC else None
 
         # if the track is an arc but is nearly or actually linear, treat as linear
-        if track_midpoint and is_midpoint_linear(track_start, track_start, track_midpoint):
+        # NOTE: original code passed (track_start, track_start, track_midpoint)
+        # here -- almost certainly a typo for (track_start, track_end, ...).
+        # With both args the same, the collinearity test is meaningless
+        # (every point is "collinear" with two coincident points).
+        if track_midpoint and is_midpoint_linear(track_start, track_end, track_midpoint):
             track_midpoint = None
 
-        if  hasattr(pcbnew,'ZONE_CONTAINER'):
-            keepout = pcbnew.ZONE_CONTAINER(pcb)
-            pts = poly_points(track_start, track_end, track_midpoint, track_width, clearance)
-            keepout.AddPolygon(pts)
-            keepout.SetIsKeepout(True)
-            if hasattr(keepout, 'SetDoNotAllowCopperPour'):
-                keepout.SetDoNotAllowCopperPour(True)
-            else:
-                keepout.SetDoNotAllowZoneFills(True)
-            keepout.SetDoNotAllowVias(False)
-            keepout.SetDoNotAllowTracks(False)
-            keepout.SetLayerSet(layer)
-        else:
-            keepout = pcbnew.ZONE(pcb)
-            pts = poly_points(track_start, track_end, track_midpoint, track_width, clearance)
-            keepout.AddPolygon(pts)
-            #keepout.SetIsKeepout(True)
-            keepout.SetIsRuleArea(True)  # was SetIsKeepout
-            if hasattr(keepout, 'SetDoNotAllowCopperPour'):
-                keepout.SetDoNotAllowCopperPour(True)
-            else:
-                keepout.SetDoNotAllowZoneFills(True)
-            keepout.SetDoNotAllowVias(False)
-            keepout.SetDoNotAllowTracks(False)
-            keepout.SetLayerSet(layer)
+        pts = poly_points(track_start, track_end, track_midpoint, track_width, clearance)
+
+        key = _layer_set_key(layer)
+        bucket = by_layer.setdefault(key, {'lset': layer, 'polys': []})
+        bucket['polys'].append(pts)
+
+    if not by_layer:
+        pcbnew.Refresh()
+        return
+
+    # Second pass: emit zones, optionally unioning per layer set.
+    for bucket in by_layer.values():
+        lset = bucket['lset']
+        polys = bucket['polys']
+
+        if not merge or len(polys) == 1:
+            # Original behaviour: one ZONE per segment polygon.
+            for pts in polys:
+                keepout = _new_keepout(pcb)
+                keepout.AddPolygon(pts)
+                keepout.SetLayerSet(lset)
+                pcb.Add(keepout)
+            continue
+
+        # Merged behaviour: union all per-segment polygons via
+        # SHAPE_POLY_SET.BooleanAdd + Simplify.  Simplify is what KiCad
+        # uses internally to merge overlapping outlines into clean
+        # non-self-intersecting polygons.
+        union = pcbnew.SHAPE_POLY_SET()
+        pm_fast = getattr(pcbnew.SHAPE_POLY_SET, 'PM_FAST', None)
+        for pts in polys:
+            single = _polyset_from_pts(pts)
+            if pm_fast is not None:
+                try:
+                    union.BooleanAdd(single, pm_fast)
+                    continue
+                except (TypeError, NotImplementedError):
+                    pass
+            union.BooleanAdd(single)
+
+        # Final cleanup pass: merges colinear vertices and any remaining
+        # self-intersections from the boolean ops.
+        _polyset_simplify(union)
+
+        if union.OutlineCount() == 0:
+            continue
+
+        # All resulting outlines go onto a single ZONE -- ZONE supports
+        # multi-outline keepouts, so even disjoint runs on the same layer
+        # collapse into one zone (matching the "one merged keepout per
+        # trace" intent the user asked for).
+        keepout = _new_keepout(pcb)
+        for i in range(union.OutlineCount()):
+            keepout.AddPolygon(_outline_to_pt_vector(union, i))
+        keepout.SetLayerSet(lset)
         pcb.Add(keepout)
 
     pcbnew.Refresh()
@@ -371,7 +526,7 @@ def semicircle_points(circle_center, radius, angle_norm, is_start=True):
                 + pcbnew.wxPoint(radius * math.cos(ang), radius * math.sin(ang))
             )
         return pcbnew.wxPoint_Vector(pts)
-    elif hasattr(pcbnew, 'wxPoint()'): #kv7 
+    elif hasattr(pcbnew, 'wxPoint()'): #kv7
         for ang in angles:
             pts.append(
                 circle_center
@@ -383,4 +538,4 @@ def semicircle_points(circle_center, radius, angle_norm, is_start=True):
                 circle_center
                 + pcbnew.VECTOR2I(int(radius * math.cos(ang)), int(radius * math.sin(ang)))
             )
-        return pcbnew.VECTOR_VECTOR2I(pts)    
+        return pcbnew.VECTOR_VECTOR2I(pts)
